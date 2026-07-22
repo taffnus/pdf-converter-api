@@ -17,33 +17,79 @@ DATABASE_URL = os.environ["DATABASE_URL"]  # aus Supabase: Project Settings -> D
 MAX_FILE_SIZE_MB = 10
 MAX_PAGES = 5
 MAX_PAGE_DIMENSION_PT = 3000
- 
- 
+FAIR_USE_LIMIT_PRO = 2000  # Konvertierungen/Monat für Pro-Plan
+
+
 class PdfTooLargeError(Exception):
     pass
- 
- 
+
+
 def get_db_connection():
     return psycopg2.connect(DATABASE_URL)
- 
- 
-def check_api_key(api_key: str) -> str:
-    """Prüft den Key gegen die Supabase-Tabelle 'api_keys'. Gibt den Plan zurück oder wirft 401/403."""
+
+
+def get_profile(api_key: str) -> dict:
+    """Holt das Profil zum API-Key aus der Supabase-Tabelle 'profiles'. Wirft 401 bei unbekanntem Key."""
     conn = get_db_connection()
     try:
         with conn.cursor() as cur:
-            cur.execute("SELECT plan, is_active FROM api_keys WHERE key = %s", (api_key,))
+            cur.execute(
+                "SELECT id, plan, credits_remaining, monthly_usage FROM profiles WHERE api_key = %s",
+                (api_key,),
+            )
             row = cur.fetchone()
     finally:
         conn.close()
- 
+
     if row is None:
         raise HTTPException(status_code=401, detail="Ungültiger API-Key")
-    plan, is_active = row
-    if not is_active:
-        raise HTTPException(status_code=403, detail="API-Key ist deaktiviert")
-    return plan
- 
+
+    profile_id, plan, credits_remaining, monthly_usage = row
+    return {
+        "id": profile_id,
+        "plan": plan,
+        "credits_remaining": credits_remaining,
+        "monthly_usage": monthly_usage,
+    }
+
+
+def check_quota(profile: dict):
+    """Prüft, ob noch Kontingent übrig ist, BEVOR konvertiert wird. Wirft 402/429, wenn nicht."""
+    if profile["plan"] == "pro":
+        if profile["monthly_usage"] >= FAIR_USE_LIMIT_PRO:
+            raise HTTPException(
+                status_code=429,
+                detail=f"Fair-Use-Grenze von {FAIR_USE_LIMIT_PRO} Konvertierungen/Monat erreicht",
+            )
+    else:
+        if profile["credits_remaining"] <= 0:
+            raise HTTPException(
+                status_code=402,
+                detail="Keine Credits mehr übrig. Bitte auf Pro upgraden.",
+            )
+
+
+def consume_quota(profile: dict):
+    """Zählt das Kontingent runter/hoch. Wird nur nach einer ERFOLGREICHEN Konvertierung aufgerufen."""
+    conn = get_db_connection()
+    try:
+        with conn.cursor() as cur:
+            if profile["plan"] == "pro":
+                cur.execute(
+                    "UPDATE profiles SET monthly_usage = monthly_usage + 1 "
+                    "WHERE id = %s AND monthly_usage < %s",
+                    (profile["id"], FAIR_USE_LIMIT_PRO),
+                )
+            else:
+                cur.execute(
+                    "UPDATE profiles SET credits_remaining = credits_remaining - 1 "
+                    "WHERE id = %s AND credits_remaining > 0",
+                    (profile["id"],),
+                )
+        conn.commit()
+    finally:
+        conn.close()
+
  
 def check_pdf_limits(pdf_path: str):
     size_mb = os.path.getsize(pdf_path) / (1024 * 1024)
@@ -83,12 +129,14 @@ def render_pdf_to_png_bytes(pdf_path: str, dpi: int = 200) -> List[bytes]:
 async def convert(file: UploadFile = File(...), x_api_key: Optional[str] = Header(None)):
     if not x_api_key:
         raise HTTPException(status_code=401, detail="Header 'X-API-Key' fehlt")
-    check_api_key(x_api_key)  # wirft 401/403 bei ungültigem oder deaktiviertem Key
- 
+
+    profile = get_profile(x_api_key)  # wirft 401 bei unbekanntem Key
+    check_quota(profile)  # wirft 402 (Free, keine Credits) oder 429 (Pro, Fair-Use erreicht)
+
     with tempfile.NamedTemporaryFile(suffix=".pdf", delete=False) as tmp:
         tmp.write(await file.read())
         tmp_path = tmp.name
- 
+
     try:
         check_pdf_limits(tmp_path)
         images = render_pdf_to_png_bytes(tmp_path)
@@ -96,7 +144,9 @@ async def convert(file: UploadFile = File(...), x_api_key: Optional[str] = Heade
         raise HTTPException(status_code=413, detail=str(e))
     finally:
         os.remove(tmp_path)
- 
+
+    consume_quota(profile)  # erst NACH erfolgreicher Konvertierung zählen
+
     if len(images) == 1:
         return Response(content=images[0], media_type="image/png")
  
