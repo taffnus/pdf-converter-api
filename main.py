@@ -203,13 +203,17 @@ async def create_checkout_session(authorization: Optional[str] = Header(None)):
 
     user_id = get_user_id_from_token(authorization.removeprefix("Bearer "))
 
-    session = stripe.checkout.Session.create(
-        mode="subscription",
-        line_items=[{"price": STRIPE_PRICE_ID, "quantity": 1}],
-        client_reference_id=user_id,
-        success_url=f"{FRONTEND_URL}/dashboard.html?upgraded=1",
-        cancel_url=f"{FRONTEND_URL}/dashboard.html",
-    )
+    try:
+        session = stripe.checkout.Session.create(
+            mode="subscription",
+            line_items=[{"price": STRIPE_PRICE_ID, "quantity": 1}],
+            client_reference_id=user_id,
+            success_url=f"{FRONTEND_URL}/dashboard.html?upgraded=1",
+            cancel_url=f"{FRONTEND_URL}/dashboard.html",
+        )
+    except stripe.error.StripeError as e:
+        raise HTTPException(status_code=400, detail=f"Stripe error: {e.user_message or str(e)}")
+
     return {"url": session.url}
 
 
@@ -233,10 +237,14 @@ async def create_portal_session(authorization: Optional[str] = Header(None)):
     if not row or not row[0]:
         raise HTTPException(status_code=404, detail="Kein aktives Pro-Abo gefunden")
 
-    portal_session = stripe.billing_portal.Session.create(
-        customer=row[0],
-        return_url=f"{FRONTEND_URL}/dashboard.html",
-    )
+    try:
+        portal_session = stripe.billing_portal.Session.create(
+            customer=row[0],
+            return_url=f"{FRONTEND_URL}/dashboard.html",
+        )
+    except stripe.error.StripeError as e:
+        raise HTTPException(status_code=400, detail=f"Stripe error: {e.user_message or str(e)}")
+
     return {"url": portal_session.url}
 
 
