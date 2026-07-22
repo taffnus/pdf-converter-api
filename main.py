@@ -213,6 +213,33 @@ async def create_checkout_session(authorization: Optional[str] = Header(None)):
     return {"url": session.url}
 
 
+@app.post("/billing/create-portal-session")
+async def create_portal_session(authorization: Optional[str] = Header(None)):
+    """Wird vom 'Manage subscription'-Link im Dashboard aufgerufen. Fuehrt zum Stripe-
+    Kundenportal, wo Nutzer selbst kuendigen, die Zahlungsmethode aendern oder Rechnungen einsehen koennen."""
+    if not authorization or not authorization.startswith("Bearer "):
+        raise HTTPException(status_code=401, detail="Authorization-Header fehlt")
+
+    user_id = get_user_id_from_token(authorization.removeprefix("Bearer "))
+
+    conn = get_db_connection()
+    try:
+        with conn.cursor() as cur:
+            cur.execute("SELECT stripe_customer_id FROM profiles WHERE id = %s", (user_id,))
+            row = cur.fetchone()
+    finally:
+        conn.close()
+
+    if not row or not row[0]:
+        raise HTTPException(status_code=404, detail="Kein aktives Pro-Abo gefunden")
+
+    portal_session = stripe.billing_portal.Session.create(
+        customer=row[0],
+        return_url=f"{FRONTEND_URL}/dashboard.html",
+    )
+    return {"url": portal_session.url}
+
+
 @app.post("/billing/webhook")
 async def stripe_webhook(request: Request):
     """Empfängt Zahlungs-Events von Stripe und aktualisiert den Plan in Supabase."""
@@ -251,6 +278,23 @@ async def stripe_webhook(request: Request):
                 with conn.cursor() as cur:
                     cur.execute(
                         "UPDATE profiles SET plan = 'free' WHERE stripe_customer_id = %s",
+                        (customer_id,),
+                    )
+                conn.commit()
+            finally:
+                conn.close()
+
+    elif event["type"] == "invoice.paid":
+        # Wird bei jeder erfolgreichen Abo-Zahlung ausgeloest (auch bei der ersten) --
+        # setzt die Fair-Use-Zaehlung fuer den neuen Abrechnungszeitraum zurueck.
+        invoice = event["data"]["object"]
+        customer_id = invoice.get("customer")
+        if customer_id:
+            conn = get_db_connection()
+            try:
+                with conn.cursor() as cur:
+                    cur.execute(
+                        "UPDATE profiles SET monthly_usage = 0 WHERE stripe_customer_id = %s",
                         (customer_id,),
                     )
                 conn.commit()
