@@ -24,6 +24,7 @@ STRIPE_WEBHOOK_SECRET = os.environ["STRIPE_WEBHOOK_SECRET"]
 STRIPE_PRICE_ID = os.environ["STRIPE_PRICE_ID"]
 
 stripe.api_key = STRIPE_SECRET_KEY
+stripe.api_version = "2025-03-31.basil"  # von Stripe gefordert (Managed Payments), aeltere Version schlaegt fehl
 
 app.add_middleware(
     CORSMiddleware,
