@@ -3,17 +3,35 @@ import io
 import zipfile
 import tempfile
 from typing import Optional, List
- 
+
 import psycopg2
-from fastapi import FastAPI, File, UploadFile, Header, HTTPException
+import requests
+import stripe
+from fastapi import FastAPI, File, UploadFile, Header, HTTPException, Request
+from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import Response
 import pypdfium2 as pdfium
- 
+
 app = FastAPI()
- 
-# --- Konfiguration über Umgebungsvariablen (in Railway einträgst du diese unter "Variables") ---
+
+# --- Konfiguration über Umgebungsvariablen (in Render einträgst du diese unter "Environment") ---
 DATABASE_URL = os.environ["DATABASE_URL"]  # aus Supabase: Project Settings -> Database -> Connection string
- 
+SUPABASE_URL = os.environ["SUPABASE_URL"]  # z.B. https://xxxx.supabase.co
+SUPABASE_ANON_KEY = os.environ["SUPABASE_ANON_KEY"]
+FRONTEND_URL = os.environ["FRONTEND_URL"]  # z.B. https://pdf-converter-website.edeka130208.workers.dev
+STRIPE_SECRET_KEY = os.environ["STRIPE_SECRET_KEY"]
+STRIPE_WEBHOOK_SECRET = os.environ["STRIPE_WEBHOOK_SECRET"]
+STRIPE_PRICE_ID = os.environ["STRIPE_PRICE_ID"]
+
+stripe.api_key = STRIPE_SECRET_KEY
+
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=[FRONTEND_URL],
+    allow_methods=["POST"],
+    allow_headers=["Authorization", "Content-Type"],
+)
+
 MAX_FILE_SIZE_MB = 10
 MAX_PAGES = 5
 MAX_PAGE_DIMENSION_PT = 3000
@@ -162,5 +180,80 @@ async def convert(file: UploadFile = File(...), x_api_key: Optional[str] = Heade
 def health():
     """Für das Uptime-Monitoring aus der Checkliste."""
     return {"status": "ok"}
- 
-    return {"status": "ok"}
+
+
+def get_user_id_from_token(access_token: str) -> str:
+    """Fragt Supabase, zu welchem eingeloggten Nutzer dieses Login-Token gehört."""
+    resp = requests.get(
+        f"{SUPABASE_URL}/auth/v1/user",
+        headers={"Authorization": f"Bearer {access_token}", "apikey": SUPABASE_ANON_KEY},
+        timeout=10,
+    )
+    if resp.status_code != 200:
+        raise HTTPException(status_code=401, detail="Ungültige oder abgelaufene Sitzung")
+    return resp.json()["id"]
+
+
+@app.post("/billing/create-checkout-session")
+async def create_checkout_session(authorization: Optional[str] = Header(None)):
+    """Wird vom 'Pro werden'-Button im Dashboard aufgerufen. Gibt eine Stripe-Checkout-URL zurück."""
+    if not authorization or not authorization.startswith("Bearer "):
+        raise HTTPException(status_code=401, detail="Authorization-Header fehlt")
+
+    user_id = get_user_id_from_token(authorization.removeprefix("Bearer "))
+
+    session = stripe.checkout.Session.create(
+        mode="subscription",
+        line_items=[{"price": STRIPE_PRICE_ID, "quantity": 1}],
+        client_reference_id=user_id,
+        success_url=f"{FRONTEND_URL}/dashboard.html?upgraded=1",
+        cancel_url=f"{FRONTEND_URL}/dashboard.html",
+    )
+    return {"url": session.url}
+
+
+@app.post("/billing/webhook")
+async def stripe_webhook(request: Request):
+    """Empfängt Zahlungs-Events von Stripe und aktualisiert den Plan in Supabase."""
+    payload = await request.body()
+    sig_header = request.headers.get("stripe-signature")
+
+    try:
+        event = stripe.Webhook.construct_event(payload, sig_header, STRIPE_WEBHOOK_SECRET)
+    except (ValueError, stripe.error.SignatureVerificationError):
+        raise HTTPException(status_code=400, detail="Ungültige Webhook-Signatur")
+
+    if event["type"] == "checkout.session.completed":
+        session = event["data"]["object"]
+        user_id = session.get("client_reference_id")
+        customer_id = session.get("customer")
+        if user_id:
+            conn = get_db_connection()
+            try:
+                with conn.cursor() as cur:
+                    cur.execute(
+                        "UPDATE profiles SET plan = 'pro', stripe_customer_id = %s, monthly_usage = 0 "
+                        "WHERE id = %s",
+                        (customer_id, user_id),
+                    )
+                conn.commit()
+            finally:
+                conn.close()
+
+    elif event["type"] in ("customer.subscription.deleted", "customer.subscription.updated"):
+        subscription = event["data"]["object"]
+        customer_id = subscription.get("customer")
+        status = subscription.get("status")
+        if status in ("canceled", "unpaid", "incomplete_expired"):
+            conn = get_db_connection()
+            try:
+                with conn.cursor() as cur:
+                    cur.execute(
+                        "UPDATE profiles SET plan = 'free' WHERE stripe_customer_id = %s",
+                        (customer_id,),
+                    )
+                conn.commit()
+            finally:
+                conn.close()
+
+    return {"received": True}
