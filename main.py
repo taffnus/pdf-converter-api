@@ -47,6 +47,13 @@ UPLOAD_CHUNK_SIZE = 1024 * 1024  # in solchen Haeppchen wird der Upload von der 
 DB_POOL_MAX = 10  # reicht fuer einen uvicorn-Worker und bleibt weit unter dem Supabase-Limit
 DB_CHECKOUT_ATTEMPTS = 3
 
+# Obergrenze fuer die laengste Kante des gerenderten Bildes.
+# MAX_PAGE_DIMENSION_PT begrenzt die Seite, nicht das Bild: 3000pt bei 200 DPI sind rund
+# 8300 Pixel pro Kante, also ~280 MB allein fuer die Bitmap, plus eine zweite Kopie durch
+# to_pil(). Eine einzige regelkonforme Seite konnte damit den Speicher des Servers sprengen.
+# A4 hat bei 200 DPI etwa 1650x2340 Pixel, normale Dokumente werden also nie angefasst.
+MAX_RENDER_PX_PER_SIDE = 4000
+
 
 class PdfTooLargeError(Exception):
     pass
@@ -228,7 +235,11 @@ def render_pdf_to_png_bytes(pdf_path: str, dpi: int = 200) -> List[bytes]:
     try:
         for i in range(len(pdf)):
             page = pdf[i]
-            bitmap = page.render(scale=dpi / 72)
+            scale = dpi / 72
+            longest_side_pt = max(page.get_size())
+            if longest_side_pt > 0 and longest_side_pt * scale > MAX_RENDER_PX_PER_SIDE:
+                scale = MAX_RENDER_PX_PER_SIDE / longest_side_pt  # grosse Seiten kleiner rendern statt Speicher fressen
+            bitmap = page.render(scale=scale)
             buf = io.BytesIO()
             bitmap.to_pil().save(buf, format="PNG")
             images.append(buf.getvalue())
