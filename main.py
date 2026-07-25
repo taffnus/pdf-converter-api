@@ -2,9 +2,13 @@ import os
 import io
 import zipfile
 import tempfile
+import secrets
+import threading
+from contextlib import contextmanager
 from typing import Optional, List
 
 import psycopg2
+from psycopg2 import pool as pg_pool
 import requests
 import stripe
 from fastapi import FastAPI, File, UploadFile, Header, HTTPException, Request
@@ -18,7 +22,7 @@ app = FastAPI()
 DATABASE_URL = os.environ["DATABASE_URL"]  # aus Supabase: Project Settings -> Database -> Connection string
 SUPABASE_URL = os.environ["SUPABASE_URL"]  # z.B. https://xxxx.supabase.co
 SUPABASE_ANON_KEY = os.environ["SUPABASE_ANON_KEY"]
-FRONTEND_URL = os.environ["FRONTEND_URL"]  # z.B. https://pdf-converter-website.edeka130208.workers.dev
+FRONTEND_URL = os.environ["FRONTEND_URL"]  # z.B. https://pixelpdf.dev
 STRIPE_SECRET_KEY = os.environ["STRIPE_SECRET_KEY"]
 STRIPE_WEBHOOK_SECRET = os.environ["STRIPE_WEBHOOK_SECRET"]
 STRIPE_PRICE_ID = os.environ["STRIPE_PRICE_ID"]
@@ -38,27 +42,88 @@ MAX_PAGES = 5
 MAX_PAGE_DIMENSION_PT = 3000
 FAIR_USE_LIMIT_PRO = 2000  # Konvertierungen/Monat für Pro-Plan
 
+MAX_FILE_SIZE_BYTES = MAX_FILE_SIZE_MB * 1024 * 1024
+UPLOAD_CHUNK_SIZE = 1024 * 1024  # in solchen Haeppchen wird der Upload von der Leitung gelesen
+DB_POOL_MAX = 10  # reicht fuer einen uvicorn-Worker und bleibt weit unter dem Supabase-Limit
+DB_CHECKOUT_ATTEMPTS = 3
+
 
 class PdfTooLargeError(Exception):
     pass
 
 
-def get_db_connection():
-    return psycopg2.connect(DATABASE_URL)
+# --- Datenbank-Verbindungen ---
+# Frueher baute jede einzelne Anfrage eine eigene Verbindung auf und warf sie danach weg.
+# Der Verbindungsaufbau dauert ein Vielfaches der eigentlichen Abfrage, und unter Last
+# reisst das irgendwann das Verbindungslimit von Supabase. Der Pool haelt stattdessen eine
+# Handvoll Verbindungen offen und reicht sie durch.
+_db_pool = None
+_db_pool_lock = threading.Lock()
+
+
+def get_db_pool():
+    """Legt den Pool beim ersten Zugriff an, nicht beim Import -- ein kurzer Datenbank-
+    Aussetzer waehrend eines Deploys soll den Serverstart nicht verhindern."""
+    global _db_pool
+    if _db_pool is None:
+        with _db_pool_lock:
+            if _db_pool is None:
+                _db_pool = pg_pool.ThreadedConnectionPool(1, DB_POOL_MAX, DATABASE_URL)
+    return _db_pool
+
+
+@contextmanager
+def db_cursor(commit: bool = False):
+    """Leiht eine Verbindung aus dem Pool und gibt sie danach zurueck.
+
+    Tote Verbindungen werden vor der Ausgabe aussortiert: Supabase trennt inaktive
+    Verbindungen nach einiger Zeit, und ohne diese Pruefung wuerde die erste Anfrage nach
+    einer Ruhephase zuverlaessig fehlschlagen.
+    """
+    pool = get_db_pool()
+
+    conn = None
+    for _ in range(DB_CHECKOUT_ATTEMPTS):
+        candidate = pool.getconn()
+        try:
+            with candidate.cursor() as cur:
+                cur.execute("SELECT 1")
+            candidate.rollback()
+            conn = candidate
+            break
+        except (psycopg2.OperationalError, psycopg2.InterfaceError):
+            pool.putconn(candidate, close=True)
+
+    if conn is None:
+        raise HTTPException(status_code=503, detail="Datenbank gerade nicht erreichbar")
+
+    healthy = True
+    try:
+        with conn.cursor() as cur:
+            yield cur
+        if commit:
+            conn.commit()
+        else:
+            conn.rollback()  # auch Lesezugriffe sauber beenden, sonst bleibt die Verbindung "idle in transaction"
+    except Exception:
+        healthy = False
+        try:
+            conn.rollback()
+        except psycopg2.Error:
+            pass
+        raise
+    finally:
+        pool.putconn(conn, close=not healthy)
 
 
 def get_profile(api_key: str) -> dict:
     """Holt das Profil zum API-Key aus der Supabase-Tabelle 'profiles'. Wirft 401 bei unbekanntem Key."""
-    conn = get_db_connection()
-    try:
-        with conn.cursor() as cur:
-            cur.execute(
-                "SELECT id, plan, credits_remaining, monthly_usage FROM profiles WHERE api_key = %s",
-                (api_key,),
-            )
-            row = cur.fetchone()
-    finally:
-        conn.close()
+    with db_cursor() as cur:
+        cur.execute(
+            "SELECT id, plan, credits_remaining, monthly_usage FROM profiles WHERE api_key = %s",
+            (api_key,),
+        )
+        row = cur.fetchone()
 
     if row is None:
         raise HTTPException(status_code=401, detail="Ungültiger API-Key")
@@ -90,24 +155,19 @@ def check_quota(profile: dict):
 
 def consume_quota(profile: dict):
     """Zählt das Kontingent runter/hoch. Wird nur nach einer ERFOLGREICHEN Konvertierung aufgerufen."""
-    conn = get_db_connection()
-    try:
-        with conn.cursor() as cur:
-            if profile["plan"] == "pro":
-                cur.execute(
-                    "UPDATE profiles SET monthly_usage = monthly_usage + 1 "
-                    "WHERE id = %s AND monthly_usage < %s",
-                    (profile["id"], FAIR_USE_LIMIT_PRO),
-                )
-            else:
-                cur.execute(
-                    "UPDATE profiles SET credits_remaining = credits_remaining - 1 "
-                    "WHERE id = %s AND credits_remaining > 0",
-                    (profile["id"],),
-                )
-        conn.commit()
-    finally:
-        conn.close()
+    with db_cursor(commit=True) as cur:
+        if profile["plan"] == "pro":
+            cur.execute(
+                "UPDATE profiles SET monthly_usage = monthly_usage + 1 "
+                "WHERE id = %s AND monthly_usage < %s",
+                (profile["id"], FAIR_USE_LIMIT_PRO),
+            )
+        else:
+            cur.execute(
+                "UPDATE profiles SET credits_remaining = credits_remaining - 1 "
+                "WHERE id = %s AND credits_remaining > 0",
+                (profile["id"],),
+            )
 
  
 def check_pdf_limits(pdf_path: str):
@@ -128,6 +188,40 @@ def check_pdf_limits(pdf_path: str):
         pdf.close()
  
  
+async def save_upload_to_tempfile(file: UploadFile) -> str:
+    """Schreibt den Upload stueckweise auf die Platte und bricht ab, sobald das Groessenlimit
+    ueberschritten ist.
+
+    Wichtig: die Datei erst komplett einzulesen (file.read() ohne Argument) und danach die
+    Groesse zu pruefen, reicht aus, um den Server mit einem einzigen sehr grossen Upload
+    ueber den Arbeitsspeicher umzubringen. Deshalb wird hier haeppchenweise gelesen und
+    mitgezaehlt.
+    """
+    written = 0
+    too_large = False
+
+    with tempfile.NamedTemporaryFile(suffix=".pdf", delete=False) as tmp:
+        tmp_path = tmp.name
+        while True:
+            chunk = await file.read(UPLOAD_CHUNK_SIZE)
+            if not chunk:
+                break
+            written += len(chunk)
+            if written > MAX_FILE_SIZE_BYTES:
+                too_large = True
+                break
+            tmp.write(chunk)
+
+    if too_large:
+        os.remove(tmp_path)
+        raise HTTPException(
+            status_code=413,
+            detail=f"Datei ist größer als {MAX_FILE_SIZE_MB} MB",
+        )
+
+    return tmp_path
+
+
 def render_pdf_to_png_bytes(pdf_path: str, dpi: int = 200) -> List[bytes]:
     pdf = pdfium.PdfDocument(pdf_path)
     images = []
@@ -152,9 +246,7 @@ async def convert(file: UploadFile = File(...), x_api_key: Optional[str] = Heade
     profile = get_profile(x_api_key)  # wirft 401 bei unbekanntem Key
     check_quota(profile)  # wirft 402 (Free, keine Credits) oder 429 (Pro, Fair-Use erreicht)
 
-    with tempfile.NamedTemporaryFile(suffix=".pdf", delete=False) as tmp:
-        tmp.write(await file.read())
-        tmp_path = tmp.name
+    tmp_path = await save_upload_to_tempfile(file)  # wirft 413, bevor grosse Dateien Speicher fressen
 
     try:
         check_pdf_limits(tmp_path)
@@ -195,6 +287,35 @@ def get_user_id_from_token(access_token: str) -> str:
     return resp.json()["id"]
 
 
+@app.post("/account/regenerate-api-key")
+async def regenerate_api_key(authorization: Optional[str] = Header(None)):
+    """Setzt einen neuen API-Key fuer den eingeloggten Nutzer; der alte wird sofort ungueltig.
+
+    Laeuft bewusst ueber den Server und nicht direkt aus dem Browser: der Browser darf per
+    RLS nicht in 'profiles' schreiben, sonst koennte sich dort jeder selbst Plan und Credits
+    hochsetzen.
+    """
+    if not authorization or not authorization.startswith("Bearer "):
+        raise HTTPException(status_code=401, detail="Authorization-Header fehlt")
+
+    user_id = get_user_id_from_token(authorization.removeprefix("Bearer "))
+    # gleiches Format wie der Spaltenstandard in Supabase (gen_random_bytes(16) als Hex),
+    # damit neu erzeugte Keys nicht anders aussehen als die bei der Registrierung
+    new_key = secrets.token_hex(16)
+
+    with db_cursor(commit=True) as cur:
+        cur.execute(
+            "UPDATE profiles SET api_key = %s WHERE id = %s RETURNING api_key",
+            (new_key, user_id),
+        )
+        row = cur.fetchone()
+
+    if row is None:
+        raise HTTPException(status_code=404, detail="Profil nicht gefunden")
+
+    return {"api_key": row[0]}
+
+
 @app.post("/billing/create-checkout-session")
 async def create_checkout_session(authorization: Optional[str] = Header(None)):
     """Wird vom 'Pro werden'-Button im Dashboard aufgerufen. Gibt eine Stripe-Checkout-URL zurück."""
@@ -226,13 +347,9 @@ async def create_portal_session(authorization: Optional[str] = Header(None)):
 
     user_id = get_user_id_from_token(authorization.removeprefix("Bearer "))
 
-    conn = get_db_connection()
-    try:
-        with conn.cursor() as cur:
-            cur.execute("SELECT stripe_customer_id FROM profiles WHERE id = %s", (user_id,))
-            row = cur.fetchone()
-    finally:
-        conn.close()
+    with db_cursor() as cur:
+        cur.execute("SELECT stripe_customer_id FROM profiles WHERE id = %s", (user_id,))
+        row = cur.fetchone()
 
     if not row or not row[0]:
         raise HTTPException(status_code=404, detail="Kein aktives Pro-Abo gefunden")
@@ -264,33 +381,23 @@ async def stripe_webhook(request: Request):
         user_id = session.get("client_reference_id")
         customer_id = session.get("customer")
         if user_id:
-            conn = get_db_connection()
-            try:
-                with conn.cursor() as cur:
-                    cur.execute(
-                        "UPDATE profiles SET plan = 'pro', stripe_customer_id = %s, monthly_usage = 0 "
-                        "WHERE id = %s",
-                        (customer_id, user_id),
-                    )
-                conn.commit()
-            finally:
-                conn.close()
+            with db_cursor(commit=True) as cur:
+                cur.execute(
+                    "UPDATE profiles SET plan = 'pro', stripe_customer_id = %s, monthly_usage = 0 "
+                    "WHERE id = %s",
+                    (customer_id, user_id),
+                )
 
     elif event["type"] in ("customer.subscription.deleted", "customer.subscription.updated"):
         subscription = event["data"]["object"]
         customer_id = subscription.get("customer")
         status = subscription.get("status")
         if status in ("canceled", "unpaid", "incomplete_expired"):
-            conn = get_db_connection()
-            try:
-                with conn.cursor() as cur:
-                    cur.execute(
-                        "UPDATE profiles SET plan = 'free' WHERE stripe_customer_id = %s",
-                        (customer_id,),
-                    )
-                conn.commit()
-            finally:
-                conn.close()
+            with db_cursor(commit=True) as cur:
+                cur.execute(
+                    "UPDATE profiles SET plan = 'free' WHERE stripe_customer_id = %s",
+                    (customer_id,),
+                )
 
     elif event["type"] == "invoice.paid":
         # Wird bei jeder erfolgreichen Abo-Zahlung ausgeloest (auch bei der ersten) --
@@ -298,15 +405,10 @@ async def stripe_webhook(request: Request):
         invoice = event["data"]["object"]
         customer_id = invoice.get("customer")
         if customer_id:
-            conn = get_db_connection()
-            try:
-                with conn.cursor() as cur:
-                    cur.execute(
-                        "UPDATE profiles SET monthly_usage = 0 WHERE stripe_customer_id = %s",
-                        (customer_id,),
-                    )
-                conn.commit()
-            finally:
-                conn.close()
+            with db_cursor(commit=True) as cur:
+                cur.execute(
+                    "UPDATE profiles SET monthly_usage = 0 WHERE stripe_customer_id = %s",
+                    (customer_id,),
+                )
 
     return {"received": True}
