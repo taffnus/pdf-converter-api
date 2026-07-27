@@ -1,9 +1,11 @@
 import os
 import io
+import time
 import zipfile
 import tempfile
 import secrets
 import threading
+from collections import deque
 from contextlib import contextmanager
 from typing import Optional, List
 
@@ -54,9 +56,77 @@ DB_CHECKOUT_ATTEMPTS = 3
 # A4 hat bei 200 DPI etwa 1650x2340 Pixel, normale Dokumente werden also nie angefasst.
 MAX_RENDER_PX_PER_SIDE = 4000
 
+# Wie viele Konvertierungen ein einzelnes Konto pro Minute ausloesen darf.
+# Das Rendern haengt am Prozessor und blockiert, und es laeuft nur ein uvicorn-Worker:
+# ein einzelner Aufrufer, der /convert im Dauerfeuer benutzt, legt damit den Dienst fuer
+# alle anderen lahm. Die Grenze deckelt ausserdem das Abgrasen der Gratis-Credits, wo eine
+# weitere E-Mail-Adresse der einzige Preis fuer weitere 200 Credits ist.
+RATE_LIMIT_PER_MINUTE = 30
+RATE_LIMIT_WINDOW_SECONDS = 60
+RATE_LIMIT_SWEEP_INTERVAL_SECONDS = 300  # wie oft leere Eintraege aufgeraeumt werden
+
 
 class PdfTooLargeError(Exception):
     pass
+
+
+class PdfUnreadableError(Exception):
+    """Die Datei laesst sich nicht als PDF oeffnen oder rendern (kaputt, leer, kein PDF,
+    passwortgeschuetzt). Fuehrt zu 400, nicht zu 500."""
+    pass
+
+
+# --- Ratenbegrenzung ---
+# Gleitendes Zeitfenster im Arbeitsspeicher. Das reicht, solange genau ein uvicorn-Worker
+# laeuft: der Zaehler lebt im selben Prozess wie das Rendern, das er schuetzen soll.
+# Bei mehreren Workern oder mehreren Instanzen zaehlt jeder Prozess fuer sich, dann braucht
+# es einen gemeinsamen Speicher (Redis) statt dieses Dictionaries.
+_rate_limit_hits = {}
+_rate_limit_lock = threading.Lock()
+_rate_limit_last_sweep = 0.0
+
+
+def check_rate_limit(user_id: str):
+    """Wirft 429, wenn dieses Konto das Minutenlimit ausgeschoepft hat.
+
+    Wichtig: gezaehlt wird VOR der Konvertierung, im Gegensatz zum Kontingent in
+    consume_quota, das erst nach einem Erfolg zaehlt. Das ist kein Widerspruch. Ein Credit
+    darf eine misslungene Konvertierung nicht kosten, Rechenzeit hat sie aber trotzdem
+    gekostet, und genau die wird hier begrenzt. Wuerde erst nach dem Erfolg gezaehlt,
+    koennte man den Server mit lauter fehlschlagenden Anfragen unbegrenzt beschaeftigen.
+
+    Gezaehlt wird nach Profil-ID aus der Datenbank, nicht nach dem uebergebenen API-Key.
+    Ein Angreifer koennte sonst mit jeder Anfrage einen neuen erfundenen Key schicken und
+    dieses Dictionary unbegrenzt wachsen lassen, bis der Speicher voll ist.
+    """
+    global _rate_limit_last_sweep
+    now = time.monotonic()
+    cutoff = now - RATE_LIMIT_WINDOW_SECONDS
+
+    with _rate_limit_lock:
+        hits = _rate_limit_hits.setdefault(user_id, deque())
+        while hits and hits[0] <= cutoff:
+            hits.popleft()
+
+        if len(hits) >= RATE_LIMIT_PER_MINUTE:
+            retry_after = max(1, int(hits[0] + RATE_LIMIT_WINDOW_SECONDS - now) + 1)
+            raise HTTPException(
+                status_code=429,
+                detail=(
+                    f"Zu viele Anfragen. Erlaubt sind {RATE_LIMIT_PER_MINUTE} Konvertierungen "
+                    f"pro Minute. Bitte in {retry_after} Sekunden erneut versuchen."
+                ),
+                headers={"Retry-After": str(retry_after)},
+            )
+
+        hits.append(now)
+
+        # Konten, die laenger nichts mehr geschickt haben, hinterlassen sonst dauerhaft
+        # eine leere Deque im Dictionary.
+        if now - _rate_limit_last_sweep > RATE_LIMIT_SWEEP_INTERVAL_SECONDS:
+            _rate_limit_last_sweep = now
+            for stale in [k for k, v in _rate_limit_hits.items() if not v or v[-1] <= cutoff]:
+                del _rate_limit_hits[stale]
 
 
 # --- Datenbank-Verbindungen ---
@@ -177,18 +247,43 @@ def consume_quota(profile: dict):
             )
 
  
+def open_pdf(pdf_path: str) -> pdfium.PdfDocument:
+    """Oeffnet die Datei mit pdfium und uebersetzt jeden Ladefehler in PdfUnreadableError.
+
+    Ohne das wird aus einer kaputten, leeren oder gar nicht als PDF gemeinten Datei ein
+    unbehandelter Fehler und damit ein 500er: der Aufrufer bekaeme "Serverfehler" gemeldet,
+    obwohl der Server einwandfrei arbeitet und schlicht die hochgeladene Datei defekt ist.
+    """
+    try:
+        return pdfium.PdfDocument(pdf_path)
+    except pdfium.PdfiumError as e:
+        # pdfium unterscheidet die Ursachen nur im Meldungstext, eine eigene Fehlerklasse
+        # pro Ursache gibt es nicht.
+        if "password" in str(e).lower():
+            raise PdfUnreadableError(
+                "PDF ist passwortgeschützt. Bitte den Schutz vor dem Hochladen entfernen."
+            )
+        raise PdfUnreadableError(
+            "Datei konnte nicht als PDF gelesen werden. Sie ist beschädigt, leer oder kein PDF."
+        )
+
+
 def check_pdf_limits(pdf_path: str):
     size_mb = os.path.getsize(pdf_path) / (1024 * 1024)
     if size_mb > MAX_FILE_SIZE_MB:
         raise PdfTooLargeError(f"Datei ist {size_mb:.1f} MB, erlaubt sind {MAX_FILE_SIZE_MB} MB")
- 
-    pdf = pdfium.PdfDocument(pdf_path)
+
+    pdf = open_pdf(pdf_path)
     try:
         page_count = len(pdf)
         if page_count > MAX_PAGES:
             raise PdfTooLargeError(f"PDF hat {page_count} Seiten, erlaubt sind {MAX_PAGES}")
         for i in range(page_count):
-            w, h = pdf[i].get_size()
+            try:
+                w, h = pdf[i].get_size()
+            except pdfium.PdfiumError:
+                # Das Dokument liess sich oeffnen, diese eine Seite ist aber unbrauchbar.
+                raise PdfUnreadableError(f"Seite {i+1} ist beschädigt und konnte nicht gelesen werden.")
             if w > MAX_PAGE_DIMENSION_PT or h > MAX_PAGE_DIMENSION_PT:
                 raise PdfTooLargeError(f"Seite {i+1} ist zu groß ({w:.0f}x{h:.0f}pt)")
     finally:
@@ -230,16 +325,19 @@ async def save_upload_to_tempfile(file: UploadFile) -> str:
 
 
 def render_pdf_to_png_bytes(pdf_path: str, dpi: int = 200) -> List[bytes]:
-    pdf = pdfium.PdfDocument(pdf_path)
+    pdf = open_pdf(pdf_path)
     images = []
     try:
         for i in range(len(pdf)):
-            page = pdf[i]
-            scale = dpi / 72
-            longest_side_pt = max(page.get_size())
-            if longest_side_pt > 0 and longest_side_pt * scale > MAX_RENDER_PX_PER_SIDE:
-                scale = MAX_RENDER_PX_PER_SIDE / longest_side_pt  # grosse Seiten kleiner rendern statt Speicher fressen
-            bitmap = page.render(scale=scale)
+            try:
+                page = pdf[i]
+                scale = dpi / 72
+                longest_side_pt = max(page.get_size())
+                if longest_side_pt > 0 and longest_side_pt * scale > MAX_RENDER_PX_PER_SIDE:
+                    scale = MAX_RENDER_PX_PER_SIDE / longest_side_pt  # grosse Seiten kleiner rendern statt Speicher fressen
+                bitmap = page.render(scale=scale)
+            except pdfium.PdfiumError:
+                raise PdfUnreadableError(f"Seite {i+1} konnte nicht gerendert werden, die Datei ist beschädigt.")
             buf = io.BytesIO()
             bitmap.to_pil().save(buf, format="PNG")
             images.append(buf.getvalue())
@@ -255,6 +353,7 @@ async def convert(file: UploadFile = File(...), x_api_key: Optional[str] = Heade
         raise HTTPException(status_code=401, detail="Header 'X-API-Key' fehlt")
 
     profile = get_profile(x_api_key)  # wirft 401 bei unbekanntem Key
+    check_rate_limit(profile["id"])  # wirft 429, bevor Rechenzeit verbraucht wird
     check_quota(profile)  # wirft 402 (Free, keine Credits) oder 429 (Pro, Fair-Use erreicht)
 
     tmp_path = await save_upload_to_tempfile(file)  # wirft 413, bevor grosse Dateien Speicher fressen
@@ -264,6 +363,8 @@ async def convert(file: UploadFile = File(...), x_api_key: Optional[str] = Heade
         images = render_pdf_to_png_bytes(tmp_path)
     except PdfTooLargeError as e:
         raise HTTPException(status_code=413, detail=str(e))
+    except PdfUnreadableError as e:
+        raise HTTPException(status_code=400, detail=str(e))
     finally:
         os.remove(tmp_path)
 
